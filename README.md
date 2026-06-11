@@ -1,278 +1,411 @@
-# ThermoVL & Variational Laplace Toolkit
+# aLogLikeFit
 
-**Author:** Alexander D. Shaw  
-**Lab:** Computational Psychiatry & Neuropharmacological Systems (CPNS), University of Exeter  
+**Thermodynamic Variational Laplace and Bayesian Model Fitting Toolkit**
+
+**Author:** Alexander D. Shaw
+**Lab:** Computational Psychiatry & Neuropharmacological Systems Lab, University of Exeter
 **Website:** https://cpnslab.com
-
-This repository contains a research-grade MATLAB toolkit for **Variational Laplace (VL)** inference in nonlinear dynamical systems, with a particular focus on **thermodynamic integration, low-rank and heteroscedastic noise models, hierarchical (PEB-style) inference, generalised coordinates, and active / polyphonic extensions**.
-
-The codebase reflects an experimental and methodological platform rather than a single “library-style” package. Many files represent alternative formulations, ablation studies, and exploratory variants used in ongoing research on **Dynamic Causal Modelling (DCM), thalamo-cortical neural mass models, computational psychiatry, and neuro-inspired AI / active inference**.
 
 ---
 
-## Conceptual Overview
+## Overview
 
-At its core, this repository implements and extends **Variational Laplace** as a practical inference scheme for models of the form:
+`aLogLikeFit` is a research MATLAB repository for fitting nonlinear generative models using **Variational Laplace**, **thermodynamic integration**, **generalised coordinates**, **hierarchical empirical Bayes**, and related Bayesian optimisation methods.
 
-\[ y = f(m, u, M) + e, \quad e \sim \mathcal{N}(0, \Sigma(\theta)) \]
+The repository is primarily designed for methodological development in:
+
+* Dynamic Causal Modelling (DCM)
+* Neural mass and thalamo-cortical modelling
+* Computational psychiatry
+* M/EEG spectral and time-series model fitting
+* Hierarchical Bayesian inference and PEB-style analysis
+* Active inference and expected free energy methods
+* Neuro-inspired AI and adaptive control
+
+This is not a polished toolbox with a single fixed API. It is a living research codebase containing core algorithms, experimental variants, demonstrations, and exploratory extensions.
+
+---
+
+## Core Idea
+
+The central aim is to fit nonlinear models of the form:
+
+```math
+y = f(\theta, u, M) + \varepsilon
+```
 
 where:
-- \( m \) are latent parameters or states
-- \( f(\cdot) \) is a nonlinear forward / generative model
-- \( \Sigma \) may be **structured, low-rank, heteroscedastic, or learned online**
 
-Key research directions represented here:
+* `y` is observed data
+* `f` is a nonlinear forward or generative model
+* `theta` are unknown parameters or latent states
+* `u` are inputs or experimental conditions
+* `M` is a model structure
+* `epsilon` is observation noise
 
-- **Thermodynamic Variational Laplace (TherMO-VL)**  
-  Annealed free energy optimisation using temperature schedules to improve convergence and reduce local minima.
+Most routines estimate posterior parameter distributions using a Laplace approximation:
 
-- **Low-rank & structured noise models**  
-  Efficient covariance representations for high-dimensional observations and spectral data.
+```math
+q(\theta) \approx \mathcal{N}(\mu, \Sigma)
+```
 
-- **Generalised Coordinates (VL-GC)**  
-  State-space inference in generalised coordinates of motion for dynamic systems and DCM-style models.
+with extensions for annealing, structured precision, low-rank noise, generalised coordinates, active inference, and hierarchical shrinkage.
 
-- **Hierarchical & Empirical Bayes (PEB / ARD)**  
-  Group-level shrinkage, automatic relevance determination, and parameter field inference.
+---
 
-- **Active / Expected Free Energy variants**  
-  Extensions toward control, policy selection, and closed-loop inference.
+## Main Features
 
-- **Polyphonic Inference**  
-  Multi-voice, non-dominating posterior representations for multimodal and non-Gaussian posteriors.
+### Thermodynamic Variational Laplace
 
-- **Riemannian & geometric updates**  
-  Metric-aware natural gradient style updates for improved optimisation stability.
+Thermodynamic VL uses an annealing or temperature schedule to improve optimisation stability and reduce sensitivity to local minima. This is useful when fitting nonlinear dynamical systems with rugged posteriors or difficult likelihood surfaces.
+
+Key files:
+
+* `VL/fitVariationalLaplaceThermo.m`
+* `VL/fitVariationalLaplaceThermo_GC.m`
+* `other_experiments/fitVariationalLaplaceThermoStable.m`
+* `other_experiments/fitVariationalLaplaceThermoStruct.m`
+
+---
+
+### Generalised Coordinates
+
+Generalised-coordinate variants support inference over trajectories, derivatives, and local dynamics, making them relevant for DCM-style state-space models and dynamic systems.
+
+Key files:
+
+* `VL/fitVariationalLaplaceThermo_GC.m`
+* `other_experiments/fitVariationalLaplaceThermo_GClam.m`
+* `other_experiments/dcm_vl_gc.m`
+* `other_experiments/dcm_vl_gc_time.m`
+
+Relevant notes:
+
+* `VL/VL_in_GeneralisedCoordinates.pdf`
+* `VL/VL_in_GC_new.pdf`
+* `VL/thermoVL_equations.pdf`
+
+---
+
+### Hierarchical VL and PEB / ARD
+
+The repository contains several routines for hierarchical inference, empirical Bayes, and automatic relevance determination. These are useful for group-level modelling, shrinkage, parameter-field inference, and predictor selection.
+
+Key files and folders:
+
+* `other_experiments/fitHierarchicalVL.m`
+* `other_experiments/Wrapper_AlogLikeDCM_fitHierarchicalVL.m`
+* `PEB/peb_ard_with_stats_var.m`
+* `PEB_ARD_general/`
+
+The `PEB_ARD_general/` folder contains a more self-contained framework for PEB-style ARD analysis, including demonstration scripts, plotting routines, cross-validation, and prediction functions.
+
+---
+
+### Low-Rank and Structured Noise Models
+
+Several routines explore alternatives to simple independent Gaussian noise, including low-rank covariance models, heteroscedastic precision updates, radial precision fields, and structured observation noise.
+
+Key files:
+
+* `other_experiments/fitVL_LowRankNoise.m`
+* `other_experiments/fitVL_LowRankNoise2.m`
+* `other_experiments/fitVariationalLaplaceThermoRadialPrecision.m`
+* `other_experiments/update_hyper.m`
+* `other_experiments/condFIM.m`
+
+These are particularly relevant for high-dimensional observations such as spectra, image-like data, or dense time-frequency representations.
+
+---
+
+### DCM and Neural Mass Model Fitting
+
+The repository includes wrappers and utilities for applying ThermoVL-style fitting to DCM and neural mass models.
+
+Key files:
+
+* `other_experiments/aFitDCM.m`
+* `other_experiments/dcm_vl_gc.m`
+* `other_experiments/dcm_vl_gc_time.m`
+* `DIP/dcm_moga.m`
+* `DIP/dip_hybrid_twocmp.m`
+* `DIP/run_dip_as.m`
+
+These routines are experimental and may assume local model structures or project-specific conventions.
+
+---
+
+### DEM-Style Inference
+
+The `DEM/` folder contains an implementation of thermodynamic VL ideas in a Dynamic Expectation Maximisation-style setting.
+
+Key files:
+
+* `DEM/fitDEM_ThermoVL.m`
+* `DEM/dem_test/`
+
+---
+
+### Bayesian SVM
+
+The `SVM/` folder contains an experimental Bayesian support vector machine formulation using thermodynamic Bayesian fitting.
+
+Key file:
+
+* `SVM/fitThermoBayesSVM.m`
+
+This is exploratory and intended as a proof-of-principle extension of the ThermoVL machinery beyond standard dynamical models.
+
+---
+
+### Polyphonic Inference
+
+The `PolyphonicObjective/` folder contains experimental routines for “polyphonic” posterior inference, where multiple posterior voices or candidate modes can coexist rather than being immediately collapsed into one Gaussian approximation.
+
+Key files:
+
+* `PolyphonicObjective/fitVariationalLaplaceThermoPolyphonic.m`
+* `PolyphonicObjective/fitVariationalLaplaceThermoPolyphonic_MO.m`
+* `PolyphonicObjective/plotPolyphonicPosterior.m`
+
+This is intended for exploring multimodal, non-Gaussian, or pluralistic posterior representations.
+
+---
+
+### Riemannian and Geometric Variants
+
+The `Riemannian/` folder contains experimental metric-aware VL updates inspired by natural gradients and information geometry.
+
+Key files:
+
+* `Riemannian/fitVariationalLaplaceThermo_Riemannian.m`
+* `Riemannian/defaultMetricDiagonalH.m`
 
 ---
 
 ## Repository Structure
 
-### Core Algorithms
-
-- `fitVariationalLaplace.m`  
-  Baseline Variational Laplace implementation.
-
-- `fitVariationalLaplaceThermo.m`  
-  Thermodynamic / annealed VL with temperature scheduling.
-
-- `fitVariationalLaplaceThermoFE.m`  
-  Free-energy–driven variant with explicit FE tracking.
-
-- `fitVariationalLaplaceThermoStable.m`  
-  Stability-enhanced version with safeguarded updates.
-
-- `fitVariationalLaplaceThermoStruct.m`  
-  Structured covariance and model-aware noise updates.
-
----
-
-### Generalised Coordinates & Dynamic Systems
-
-- `fitVariationalLaplaceThermo_GC.m`  
-- `fitVariationalLaplaceThermo_GClam.m`  
-- `dcm_vl_gc.m`, `dcm_vl_gc_time.m`  
-
-VL in generalised coordinates for state-space and DCM-style inference.
-
-See:
-- `VL_in_GeneralisedCoordinates.pdf`
-- `VL_in_GC_new.pdf`
-
----
-
-### Hierarchical Inference & Empirical Bayes
-
-- `fitHierarchicalVL.m`  
-- `Wrapper_AlogLikeDCM_fitHierarchicalVL.m`
-
-#### PEB / ARD Framework (`PEB_ARD_general/`)
-
-Group-level parameter field inference with automatic relevance determination:
-
-- `demo_peb_ard.m`
-- `peb_ard_novar.m`
-- `peb_ard_predict.m`
-- `peb_plot_betas.m`
-- `peb_plot_beta_densities.m`
-- `peb_plot_lambda.m`
-
-Includes examples, cross-validation, and shrinkage visualisation tools.
-
----
-
-### Noise Models & Likelihood Variants
-
-- `fitVL_LowRankNoise.m`, `fitVL_LowRankNoise2.m`  
-  Low-rank and structured observation noise models.
-
-- `fitVariationalLaplaceThermoRadialPrecision.m`  
-  Radial / precision-field updates.
-
-- `fitLogLikelihoodLM.m`, `fitLogLikelihoodLMFE.m`  
-  Likelihood-based fitting and free-energy variants.
-
----
-
-### Polyphonic Inference (Multimodal Posteriors)
-
-Located in `polyphonic/`
-
-- `fitVariationalLaplaceThermoPolyphonic.m`  
-  Multi-voice VL where several coupled Gaussian posteriors coexist and are softly aligned by predictive agreement rather than collapsed into a single mode.
-
-- `plotPolyphonicPosterior.m`  
-  Visualisation of multimodal and non-unimodal posterior structure.
-
-This is experimental and intended for research into **pluralistic inference and non-dominating integration**.
+```text
+aLogLikeFit/
+│
+├── DEM/
+│   ├── fitDEM_ThermoVL.m
+│   └── dem_test/
+│
+├── DIP/
+│   ├── dcm_moga.m
+│   ├── dip_hybrid_twocmp.m
+│   └── run_dip_as.m
+│
+├── other_experiments/
+│   ├── aFitDCM.m
+│   ├── fitVariationalLaplace.m
+│   ├── fitVariationalLaplaceThermo_active.m
+│   ├── fitVariationalLaplaceThermo_BayesARD.m
+│   ├── fitVariationalLaplaceThermo_GC_EBM.m
+│   ├── fitVariationalLaplaceThermo_GClam.m
+│   ├── fitVariationalLaplaceThermoStable.m
+│   ├── fitVariationalLaplaceThermoStruct.m
+│   ├── fitVL_LowRankNoise.m
+│   ├── fitVL_LowRankNoise2.m
+│   ├── fitVL_ThermoMoG.m
+│   ├── fitHierarchicalVL.m
+│   ├── Wrapper_AlogLikeDCM_fitHierarchicalVL.m
+│   └── supporting utilities and plotting functions
+│
+├── PEB/
+│   └── peb_ard_with_stats_var.m
+│
+├── PEB_ARD_general/
+│   ├── demo_peb_ard.m
+│   ├── example_script.m
+│   ├── example_usage_PEB_ARD_general.m
+│   ├── peb_ard_novar.m
+│   ├── peb_ard_predict.m
+│   ├── peb_plot_betas.m
+│   ├── peb_plot_beta_densities.m
+│   ├── peb_plot_lambda.m
+│   └── readme.md
+│
+├── PolyphonicObjective/
+│   ├── fitVariationalLaplaceThermoPolyphonic.m
+│   ├── fitVariationalLaplaceThermoPolyphonic_MO.m
+│   └── plotPolyphonicPosterior.m
+│
+├── Riemannian/
+│   ├── defaultMetricDiagonalH.m
+│   └── fitVariationalLaplaceThermo_Riemannian.m
+│
+├── SVM/
+│   └── fitThermoBayesSVM.m
+│
+├── test_fun/
+│   ├── demo_fitVL_struct_toy.m
+│   ├── demo_VLGC.m
+│   ├── test_fitHierarchicalVL.m
+│   ├── TestFun_BiExpDelay.m
+│   ├── TestFun_SigmoidShift.m
+│   └── TestFunc_InverseEstimatorLogisticGrowthModel.m
+│
+└── VL/
+    ├── fitVariationalLaplaceThermo.m
+    ├── fitVariationalLaplaceThermo_GC.m
+    ├── fitVariationalLaplaceThermoFE.m
+    ├── fitLogLikelihoodLM.m
+    ├── thermoVL_equations.pdf
+    ├── VL_in_GC_new.pdf
+    └── VL_in_GeneralisedCoordinates.pdf
+```
 
 ---
 
-### Active / Control-Oriented Variants
+## Suggested Entry Points
 
-- `fitVariationalLaplaceThermo_active.m`  
-  Extension toward expected free energy minimisation and action selection.
+For most users, the best starting points are:
 
-- `fitDEM_ThermoVL.m`  
-  DEM-style state and parameter inference under thermodynamic VL.
-
----
-
-### Riemannian & Geometric Optimisation
-
-Located in `riemannian/`
-
-- `fitVariationalLaplaceThermo_Riemannian.m`  
-- `defaultMetricDiagonalH.m`
-
-Metric-aware update rules inspired by natural gradients and information geometry.
+| Goal                             | Suggested file                                                |
+| -------------------------------- | ------------------------------------------------------------- |
+| Basic thermodynamic VL           | `VL/fitVariationalLaplaceThermo.m`                            |
+| VL in generalised coordinates    | `VL/fitVariationalLaplaceThermo_GC.m`                         |
+| DCM-style fitting                | `other_experiments/aFitDCM.m`                                 |
+| Hierarchical VL                  | `other_experiments/fitHierarchicalVL.m`                       |
+| PEB / ARD analysis               | `PEB_ARD_general/demo_peb_ard.m`                              |
+| Low-rank noise modelling         | `other_experiments/fitVL_LowRankNoise.m`                      |
+| DEM-style inference              | `DEM/fitDEM_ThermoVL.m`                                       |
+| Bayesian SVM experiment          | `SVM/fitThermoBayesSVM.m`                                     |
+| Polyphonic posterior experiments | `PolyphonicObjective/fitVariationalLaplaceThermoPolyphonic.m` |
+| Riemannian VL experiment         | `Riemannian/fitVariationalLaplaceThermo_Riemannian.m`         |
 
 ---
 
-### DCM, Neurodynamics & Model Fitting
+## Minimal ThermoVL Workflow
 
-- `aFitDCM.m`  
-  Wrapper for fitting DCM / neural mass models using ThermoVL backends.
+A typical workflow is:
 
-- `condFIM.m`  
-  Conditional Fisher Information Matrix utilities.
+1. Define a forward model.
+2. Specify priors.
+3. Run a VL or ThermoVL routine.
+4. Inspect posterior estimates, free energy, and model predictions.
 
-- `propose_deltaF_ranked.m`  
-  Model comparison and ranked free-energy perturbations.
-
-- `dip/`  
-  Hybrid optimisation and MOGA-based parameter search for dynamical inversion problems.
-
----
-
-### Demonstrations & Test Functions
-
-Located in:
-- `dem_test/`
-- `test_fun/`
-
-Includes toy systems, nonlinear oscillators, bi-exponential delays, sigmoid shifts, and hierarchical test cases for validating inference behaviour.
-
----
-
-### Theory & Technical Notes
-
-- `thermoVL_equations.pdf`  
-  Formal derivation of thermodynamic VL and annealed free energy updates.
-
-- `Extending_Variational_Laplace_for_Hierarchical_Model_Fitting__Innovations_in_fitVLLowRankNoise_3.pdf`  
-  Low-rank noise, hierarchical inference, and empirical Bayes extensions.
-
----
-
-## Typical Workflow
-
-### 1. Define a Forward Model
-
-Write a MATLAB function:
+Example forward model:
 
 ```matlab
-function yhat = f(m, M, U)
-    % m : parameter vector
-    % M : model structure
-    % U : inputs
-    % yhat : predicted observations
+function yhat = my_forward_model(theta, M, U)
+    % theta : parameter vector
+    % M     : model structure
+    % U     : inputs or experimental design
+    %
+    % yhat  : predicted observations
+
+    yhat = M.fun(theta, U);
 end
 ```
 
-### 2. Set Priors
+Example fitting call:
 
 ```matlab
+% Observed data
+y = observed_data;
+
+% Priors
 m0 = prior_mean;
 S0 = prior_covariance;
+
+% Options
+OPT = struct();
+OPT.Tschedule = linspace(2.0, 1.0, 16);
+OPT.maxIter = 128;
+
+% Fit model
+OUT = fitVariationalLaplaceThermo(y, @my_forward_model, m0, S0, OPT);
 ```
 
-### 3. Run ThermoVL
+Typical outputs may include:
 
 ```matlab
-OPT.Tschedule = linspace(2.0, 1.0, 16);
-OUT = fitVariationalLaplaceThermo(y, @f, m0, S0, OPT);
+OUT.m      % posterior mean
+OUT.S      % posterior covariance
+OUT.F      % free energy trajectory
+OUT.yhat   % model prediction
 ```
 
-### 4. Inspect
+Exact output fields vary between routines.
 
-- Posterior means / covariances: `OUT.m`, `OUT.S`
-- Free energy trajectory: `OUT.F`
-- Predictions: `OUT.yhat`
+---
+
+## Notes on Code Status
+
+This repository is an active methodological workspace. Some functions are mature enough for reuse, while others are exploratory prototypes.
+
+Users should expect:
+
+* overlapping implementations
+* inconsistent function signatures across variants
+* project-specific assumptions in some scripts
+* partial documentation
+* experimental branches of the same core idea
+* occasional dependencies on local model structures or data conventions
+
+The most stable entry points are likely to be the main routines in `VL/`, the PEB examples in `PEB_ARD_general/`, and the simpler test functions in `test_fun/`.
 
 ---
 
 ## Research Context
 
-This toolkit underpins ongoing work in:
+This code supports research on Bayesian inversion of nonlinear dynamical systems, with applications to computational psychiatry, M/EEG modelling, pharmacological neuroimaging, predictive coding, active inference, and neuro-inspired AI.
 
-- Computational psychiatry (M/EEG, pharmacological modelling, synaptic inference)
-- Thalamo-cortical and neural mass modelling
-- Predictive coding and active inference
-- Free energy methods for adaptive and neuro-inspired AI
-- Hierarchical Bayesian modelling in clinical and translational neuroscience
+Specific methodological themes include:
 
-Several components directly support work described in:
-
-> Shaw, A.D. *Polyphonic Intelligence: Constraint-Based Emergence, Pluralistic Inference, and Non-Dominating Integration*
-
-and related manuscripts on **thermodynamic variational inference, predictive coding, and mechanistic AI**.
+* annealed variational inference
+* Laplace approximations for nonlinear model fitting
+* free-energy optimisation
+* structured and heteroscedastic noise models
+* empirical Bayes and hierarchical shrinkage
+* generalised coordinates of motion
+* active inference and expected free energy
+* multimodal posterior approximation
+* information-geometric optimisation
 
 ---
 
-## Status & Philosophy
+## Dependencies
 
-This is a **living research repository**. Code quality, interfaces, and naming conventions reflect an evolving experimental platform rather than a polished software release.
+The repository is written primarily in MATLAB.
 
-Expect:
-- Multiple overlapping implementations
-- Partially documented experimental variants
-- Research-grade performance rather than production-grade APIs
+Some routines may require:
 
-If you are looking for a clean entry point, start with:
+* MATLAB Optimization Toolbox
+* MATLAB Statistics and Machine Learning Toolbox
+* SPM, for DCM-related workflows
+* project-specific model files or data structures
 
-- `fitVariationalLaplaceThermo.m`
-- `aFitDCM.m`
-- `demo_peb_ard.m`
+Dependencies vary by subfolder and routine.
 
 ---
 
 ## Citation
 
-If you use this code in academic work, please the github.
+If you use this repository in academic work, please cite the relevant paper, preprint, or repository associated with the method you use.
 
----
+Suggested repository citation:
 
-## Contact
+> Shaw, A. D. `aLogLikeFit`: Thermodynamic Variational Laplace and Bayesian Model Fitting Toolkit. Computational Psychiatry & Neuropharmacological Systems Lab, University of Exeter.
 
-**Alexander D. Shaw**  
-Senior Lecturer in Neuroscience & Computational Psychiatry  
-University of Exeter  
-https://cpnslab.com
+A formal citation will be added when associated manuscripts or archived releases are available.
 
 ---
 
 ## License
 
-This repository is released for **academic and research use**. Please see the project’s license file or contact the author for commercial usage and collaboration.
+This repository is intended for academic and research use.
 
+For commercial use, collaboration, or reuse in external projects, please contact the author.
+
+---
+
+## Contact
+
+**Alexander D. Shaw**
+Senior Lecturer in Neuroscience and Computational Psychiatry
+University of Exeter
+Website: https://cpnslab.com
