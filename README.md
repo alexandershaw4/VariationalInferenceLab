@@ -10,7 +10,7 @@
 
 ## Overview
 
-`aLogLikeFit` is a research MATLAB repository for fitting nonlinear generative models using **Variational Laplace**, **thermodynamic integration**, **generalised coordinates**, **hierarchical empirical Bayes**, and related Bayesian optimisation methods.
+`VariationalInferenceLab` is a research MATLAB repository for fitting nonlinear generative models using **Variational Laplace**, **thermodynamic integration**, **generalised coordinates**, **hierarchical empirical Bayes**, and related Bayesian optimisation methods.
 
 The repository is primarily designed for methodological development in:
 
@@ -186,7 +186,7 @@ Key files:
 ## Repository Structure
 
 ```text
-aLogLikeFit/
+VariationalInferenceLab/
 │
 ├── DEM/
 │   ├── fitDEM_ThermoVL.m
@@ -389,7 +389,7 @@ If you use this repository in academic work, please cite the relevant paper, pre
 
 Suggested repository citation:
 
-> Shaw, A. D. `aLogLikeFit`: Thermodynamic Variational Laplace and Bayesian Model Fitting Toolkit. Computational Psychiatry & Neuropharmacological Systems Lab, University of Exeter.
+> Shaw, A. D. `VariationalInferenceLab`: Thermodynamic Variational Laplace and Bayesian Model Fitting Toolkit. Computational Psychiatry & Neuropharmacological Systems Lab, University of Exeter.
 
 A formal citation will be added when associated manuscripts or archived releases are available.
 
