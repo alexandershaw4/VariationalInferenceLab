@@ -1,4 +1,4 @@
-# aLogLikeFit
+# VariationalInferenceLab
 
 **Thermodynamic Variational Laplace and Bayesian Model Fitting Toolkit**
 
