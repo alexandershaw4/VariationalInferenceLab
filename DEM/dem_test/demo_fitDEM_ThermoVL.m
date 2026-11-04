@@ -1,4 +1,4 @@
-function demo_fitDEM_ThermoVL()
+function [POST, TRACE] = demo_fitDEM_ThermoVL(doplot)
 % DEMO for fitDEM_ThermoVL on a 2-state nonlinear damped oscillator
 %   x1' = x2
 %   x2' = -k*x1 - c*x2 + a*tanh(x1)
@@ -6,7 +6,12 @@ function demo_fitDEM_ThermoVL()
 %
 % True theta = [k; c; a]; we try to recover them from y(t).
 
+if nargin < 1, doplot = true; end
 rng(42);
+
+% Make this demo runnable from any working directory.
+demo_dir = fileparts(mfilename('fullpath'));
+addpath(demo_dir, fileparts(demo_dir));
 
 % ----- ground truth system -----
 dt     = 1/200;             % 200 Hz
@@ -21,7 +26,14 @@ x0_true    = [0.8; 0.0];
 x = zeros(nx,T);
 x(:,1) = x0_true;
 for t = 2:T
-    x(:,t) = x(:,t-1) + dt * f_osc_nl(x(:,t-1), theta_true);
+    % Simulate the continuous model accurately; forward Euler introduces a
+    % damping/frequency bias that should not be mistaken for fit error.
+    z = x(:,t-1);
+    k1 = f_osc_nl(z,theta_true);
+    k2 = f_osc_nl(z+dt*k1/2,theta_true);
+    k3 = f_osc_nl(z+dt*k2/2,theta_true);
+    k4 = f_osc_nl(z+dt*k3,theta_true);
+    x(:,t) = z+dt*(k1+2*k2+2*k3+k4)/6;
 end
 
 % generate observations
@@ -42,16 +54,19 @@ opts.Dx_iters      = 2;
 opts.outer_iters   = 10;
 opts.gamma_y       = 1.0;
 opts.gamma_x       = 1.0;
-%opts.lambda_y0     = 1/var(y,0,'all');
-opts.lambda_y0     = 1/max(var(y(:)), 1e-6);
+opts.lambda_y0     = 1/sigma_y^2;
 opts.lambda_x0     = 1.0;
 opts.pE_theta      = theta0;
-opts.pC_theta      = eye(numel(theta0))*1e2;
+opts.pC_theta      = diag([(0.5*theta0(1))^2, (0.5*theta0(2))^2, 10^2]);
 opts.pE_x0         = zeros((opts.p+1)*nx,1);
-opts.pC_x0         = eye((opts.p+1)*nx)*1e2;
+% Position, velocity and higher derivatives have different physical units.
+omega = 2*pi*2;
+gc_sd = [1;omega;omega;omega^2;omega^2;omega^3];
+opts.pC_x0         = diag((10*gc_sd).^2);
 opts.varpercthresh = 0.01;
 opts.max_rank_theta= numel(theta0);
-opts.plot          = 1;
+opts.plot          = doplot;
+opts.verbose       = true;
 
 opts.burnin_fix_ly = 3;
 
@@ -60,21 +75,18 @@ opts.burnin_fix_ly = 3;
 f = @(x,theta) f_osc_nl(x,theta);
 g = @(x,theta) g_lin(x);
 
-% --- standardise y for well-scaled residuals ---
-muY = mean(y,1);  sdY = std(y,0,1);  sdY(sdY==0) = 1;
-ys  = (y - muY)./sdY;
-
-% use a *scalar* precision consistent with scaled data
-opts.lambda_y0 = 1;      % data ~ unit variance after z-scoring
-
+% Keep physical units: z-scoring y alone changes the nonlinear state model.
 
 % ----- fit -----
-[POST, TRACE] = fitDEM_ThermoVL(ys, f, g, x0_guess, theta0, opts);
+[POST, TRACE] = fitDEM_ThermoVL(y, f, g, x0_guess, theta0, opts);
 
 % ----- quick report -----
-fprintf('\n=== Parameter recovery ===\n');
-disp(table(theta_true(:), POST.theta_mean(:), ...
-    'VariableNames',{'theta_true','theta_est'}));
+fprintf('\n=== Conditional parameter estimates ===\n');
+fprintf('             true        estimate     conditional SD\n');
+disp([theta_true(:), POST.theta_mean(:), sqrt(diag(POST.theta_C))]);
+fprintf('The small nonlinear coefficient a is weakly identified by this short damped transient.\n');
+
+if ~doplot, return; end
 
 % overlay fit
 tspan = (0:T-1)*dt;
@@ -83,14 +95,6 @@ for tt = 1:T
     yhat(tt,:) = g(POST.xgc_path(tt,1:nx).', POST.theta_mean);
 end
 
-% predicted on scaled space
-yhat_sc = zeros(T,1);
-for tt = 1:T
-    yhat_sc(tt,:) = g(POST.xgc_path(tt,1:nx).', POST.theta_mean);
-end
-% unscale for overlay
-yhat = yhat_sc.*sdY + muY;
-
 figure('Color','w','Name','Fit overlay');
 plot(tspan, y, 'k-', 'DisplayName','Observed'); hold on;
 plot(tspan, yhat, 'r-', 'DisplayName','Predicted');
@@ -98,9 +102,13 @@ xlabel('Time (s)'); ylabel('y'); legend; title('Observed vs Predicted');
 
 % parameter trajectory
 figure('Color','w','Name','Parameter trajectory');
-plot(TRACE.theta_hist','-o'); hold on;
-yline(theta_true(1),'--'); yline(theta_true(2),'--'); yline(theta_true(3),'--');
-xlabel('Outer iteration'); ylabel('\theta'); title('Parameter means over iterations');
-legend({'\theta_1','\theta_2','\theta_3','true'},'Location','best');
+names = {'k','c','a'};
+for j = 1:numel(theta_true)
+    subplot(3,1,j);
+    plot(1:opts.outer_iters,TRACE.theta_hist(j,:),'-o'); hold on;
+    plot(1:opts.outer_iters,theta_true(j)*ones(1,opts.outer_iters),'--');
+    ylabel(names{j}); legend('Estimate','True','Location','best');
+end
+xlabel('Outer iteration');
 
 end

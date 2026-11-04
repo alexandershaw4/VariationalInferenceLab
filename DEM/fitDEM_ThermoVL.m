@@ -1,491 +1,370 @@
 function [POST, TRACE] = fitDEM_ThermoVL(y, f, g, x0, theta0, opts)
-% fitDEM_ThermoVL  —  DEM-style D/E/M using thermoVL
+% fitDEM_ThermoVL  DEM-style generalised-coordinate trajectory smoother.
 %
-% Nonlinear state-space:
-%   x' = f(x, theta) + w,   y = g(x, theta) + z
+% Model: x' = f(x,theta) + w; y = g(x,theta) + z.
+% D: sparse Gauss-Newton smoothing of the WHOLE state trajectory.
+% E: joint Gauss-Newton parameter/state update (avoids slow EM zig-zagging).
+% M: scalar Gamma precision updates for the weighted residuals.
 %
-% Generalised coords (order p):
-%   \tilde{x} = [x, x', x'', ...],   \tilde{y} likewise (estimated)
-% Motion error: eps_x = D*\tilde{x} - \tilde{f}(\tilde{x},theta)
-% Output error: eps_y = \tilde{y} - \tilde{g}(\tilde{x},theta)
+% Generalised states are derivatives of ONE trajectory, rather than freely
+% fitted vectors at each sample. Motion errors stop at order p-1: the missing
+% derivative of order p+1 is not assumed to be zero.
 %
-% DEM cycle:
-%   D-step: update \tilde{x}_t via Gauss–Newton on free-action
-%   E-step: update theta via accumulated curvature (low-rank precision)
-%   M-step: update precisions (lambda_y, lambda_x) via Gamma posteriors
+% This is a finite-difference MAP/EM approximation in generalised coordinates,
+% not the full SPM DEM variational filter. Fa is a negative penalised residual
+% energy, not a calibrated ELBO or model evidence. Covariance corrections in
+% the M-step, posterior state covariances and thermodynamic annealing are not
+% implemented. The historical public function name is retained.
 %
-% Inputs
-%   y        [T x ny]
-%   f        @(x,theta) -> nx x 1
-%   g        @(x,theta) -> ny x 1
-%   x0       [nx x 1]   initial state mean
-%   theta0   [np x 1]   initial parameter mean
-%   opts     (optional) fields:
-%       .dt, .p (default 2), .py (default 0; output GC off)
-%       .Dx_iters (default 2), .outer_iters (default 8)
-%       .gamma_y/x (defaults 1), .lambda_y0 (default 1/var(y(:)))
-%       .lambda_x0 (default 10), .pE_theta/.pC_theta
-%       .pE_x0/.pC_x0, .varpercthresh, .max_rank_theta
-%       .burnin_fix_ly (default 3), .burnin_fix_lx (default same as ly)
-%       .lambda_x_target (default 10), .lambda_x_ramp (default 1.8)
-%       .plot (0/1)
+% Inputs: y [T,ny]; f/g @(x,theta) returning nx/ny values;
+%         x0 [nx,1]; theta0 [np,1]; optional opts fields:
+%   dt=1, p=2 (0:2), py=0 (0:p), Dx_iters=2, outer_iters=8,
+%   gamma_y=1, gamma_x=1, lambda_y0=1/var(y(:)), lambda_x0=10,
+%   pE_theta=theta0, pC_theta=10*eye(np), pE_x0, pC_x0,
+%   theta_step=1, max_theta_step=2 (prior SD units),
+%   varpercthresh=.01, max_rank_theta=np,
+%   burnin_fix_ly=3, burnin_fix_lx=burnin_fix_ly,
+%   lambda_x_target=10, lambda_x_ramp=1.8, plot=false, verbose=plot.
 %
-% Outputs
-%   POST: x_path, xgc_path, theta_mean, theta_V/D, lambda_y/x
-%   TRACE: Fa, sumsq_y/x, theta_hist, lambda_hist
-%
-% AS2025 (with stability & λx ramp tweaks)
+% POST.theta_V*POST.theta_V' + POST.theta_D approximates the conditional
+% parameter PRECISION, not covariance. POST.theta_C is the full inverse of
+% the final conditional Gauss-Newton precision (no optimiser damping).
+% TRACE.dstep_cost/estep_cost give [before; after] costs at fixed precisions.
 
-% -------------------- defaults --------------------
 if nargin < 6, opts = struct; end
-dt      = getd(opts,'dt',1.0);
-p       = getd(opts,'p',2);
-py      = getd(opts,'py',0);              % output GC OFF by default
-
-Dx_it   = getd(opts,'Dx_iters',2);
-outerIt = getd(opts,'outer_iters',8);
-gamY    = getd(opts,'gamma_y',1.0);
-gamX    = getd(opts,'gamma_x',1.0);
-[Tx,ny] = size(y);
-
-nx = numel(x0);
-theta = theta0(:);
-np = numel(theta);
-
-pE_theta = getd(opts,'pE_theta',theta0(:));
-pC_theta = getd(opts,'pC_theta',eye(np)*1e1);
-
-% prior on initial generalised state
-xgc0_mu = getd(opts,'pE_x0',zeros((p+1)*nx,1));
-xgc0_C  = getd(opts,'pC_x0',eye((p+1)*nx)*1e1);
-
-% precisions
-v_all = var(y(:));                                            % scalar
-ly    = getd(opts,'lambda_y0', 1/max(v_all, 1e-6));           % init obs precision
-lx    = getd(opts,'lambda_x0', 10.0);                         % stronger dynamics by default
-
-burnin_fix_ly    = getd(opts,'burnin_fix_ly',3);
-burnin_fix_lx    = getd(opts,'burnin_fix_lx',burnin_fix_ly);
-lambda_x_target  = getd(opts,'lambda_x_target',10);
-lambda_x_ramp    = getd(opts,'lambda_x_ramp',1.8);            % multiplicative ramp per iter
-
-% low-rank threshold for param Hessian
-varthr = getd(opts,'varpercthresh',0.01);
-kmax   = getd(opts,'max_rank_theta',np);
-
-doplot = getd(opts,'plot',0);
-
-% temporal weights for each GC order: w_k = (gamma^k)/(dt^k)
-wy = (gamY.^((0:py)))./(dt.^(0:py)); wy = wy / max(wy);
-wx = (gamX.^((0:p )))./(dt.^(0:p )); wx = wx / max(wx);
-
-% derivative operator D on generalised coordinates (truncated shift)
-Dop = kron( eye(p+1), zeros(nx) );
-for k=1:p
-    row   = (k-1)*nx + (1:nx);
-    col   =  k   *nx + (1:nx);
-    Dop(row, col) = eye(nx);
+validateattributes(y, {'numeric'}, {'2d','real','finite','nonempty'}, mfilename, 'y');
+validateattributes(x0, {'numeric'}, {'vector','real','finite','nonempty'}, mfilename, 'x0');
+validateattributes(theta0, {'numeric'}, {'vector','real','finite','nonempty'}, mfilename, 'theta0');
+y = double(y); x0 = double(x0(:)); theta = double(theta0(:));
+[T,ny] = size(y); nx = numel(x0); np = numel(theta);
+dt = getd(opts,'dt',1);
+p = getd(opts,'p',2); py = getd(opts,'py',0);
+Dx_it = getd(opts,'Dx_iters',2); outerIt = getd(opts,'outer_iters',8);
+positive(dt,'dt'); integer_range(p,0,2,'p'); integer_range(py,0,p,'py');
+integer_range(Dx_it,1,Inf,'Dx_iters'); integer_range(outerIt,1,Inf,'outer_iters');
+if T < p+1
+    error('fitDEM_ThermoVL:TooFewSamples', 'GC order p requires at least p+1 samples.');
 end
+model_value(f,x0,theta,nx); model_value(g,x0,theta,ny);
+ngc = (p+1)*nx;
 
-% (Output DopY kept for completeness; not used when py=0)
-DopY = kron(eye(p+1), zeros(ny)); %#ok<NASGU>
-for k = 1:p
-    row = (k-1)*ny + (1:ny);
-    col =  k   *ny + (1:ny);
-    DopY(row,col) = eye(ny);
+pE_theta = getd(opts,'pE_theta',theta); pE_theta = pE_theta(:);
+pC_theta = getd(opts,'pC_theta',10*eye(np));
+if numel(pE_theta) ~= np || any(~isfinite(pE_theta))
+    error('fitDEM_ThermoVL:PriorSize', 'pE_theta must contain np finite values.');
 end
+Htheta = prior_precision(pC_theta,np,'pC_theta');
 
-% precompute generalised observations from data
-Ygc = generalise_observation(y, py, dt); % [T x (p+1)*ny]
+% Centre the default initial GC prior on x0 and its model flow.
+seed = zeros(nx,p+1); seed(:,1) = x0;
+if p >= 1, seed(:,2) = model_value(f,x0,theta,nx); end
+if p >= 2, seed(:,3) = jacobian_fd(@(x) f(x,theta),x0)*seed(:,2); end
+mu0 = getd(opts,'pE_x0',seed(:)); mu0 = mu0(:);
+if numel(mu0) ~= ngc || any(~isfinite(mu0))
+    error('fitDEM_ThermoVL:PriorSize', 'pE_x0 must contain (p+1)*nx finite values.');
+end
+C0 = getd(opts,'pC_x0',10*eye(ngc));
+H0 = prior_precision(C0,ngc,'pC_x0'); L0 = chol(H0);
 
-% storage
-xgc_path = zeros(Tx,(p+1)*nx);
-x_path   = zeros(Tx,nx);
+ly = getd(opts,'lambda_y0',1/max(var(y(:)),1e-6));
+lx = getd(opts,'lambda_x0',10);
+positive(ly,'lambda_y0'); positive(lx,'lambda_x0');
+gamY = getd(opts,'gamma_y',1); gamX = getd(opts,'gamma_x',1);
+positive(gamY,'gamma_y'); positive(gamX,'gamma_x');
+% Downweight derivatives, retaining unit weight on the actual flow error.
+wy = (gamY*dt).^(0:py);
+wx = (gamX*dt).^(0:p-1);
+if any(~isfinite([wy wx]))
+    error('fitDEM_ThermoVL:Weights', 'Generalised-coordinate weights overflowed.');
+end
+alpha_theta = getd(opts,'theta_step',1);
+max_step = getd(opts,'max_theta_step',2);
+positive(alpha_theta,'theta_step'); positive(max_step,'max_theta_step');
+burnY = getd(opts,'burnin_fix_ly',3); burnX = getd(opts,'burnin_fix_lx',burnY);
+integer_range(burnY,0,Inf,'burnin_fix_ly'); integer_range(burnX,0,Inf,'burnin_fix_lx');
+lx_target = getd(opts,'lambda_x_target',10); lx_ramp = getd(opts,'lambda_x_ramp',1.8);
+positive(lx_target,'lambda_x_target'); positive(lx_ramp,'lambda_x_ramp');
+varthr = getd(opts,'varpercthresh',.01); kmax = getd(opts,'max_rank_theta',np);
+validateattributes(varthr,{'numeric'},{'scalar','real','finite','>=',0,'<=',1});
+integer_range(kmax,1,Inf,'max_rank_theta');
+doplot = getd(opts,'plot',false); verbose = getd(opts,'verbose',doplot);
 
-theta_hist  = zeros(np,outerIt);
-lambda_hist = zeros(2,outerIt);
-Fa_trace    = zeros(1,outerIt);
-sumsq_y     = zeros(1,outerIt);
-sumsq_x     = zeros(1,outerIt);
+% Map v=[x_1; ...; x_T] to all GC orders with sparse derivative operators.
+D = derivative_operators(T,p,dt);
+G = sparse(T*ngc,T*nx);
+for k = 0:p
+    rows = reshape(bsxfun(@plus,(k*nx+(1:nx)).',(0:T-1)*ngc),[],1);
+    G(rows,:) = kron(D{k+1},speye(nx));
+end
+Ygc = zeros(T,(py+1)*ny);
+for k = 0:py, Ygc(:,k*ny+(1:ny)) = D{k+1}*y; end
+nr = (py+1)*ny + p*nx;
+[ir,jc] = ndgrid(1:nr,1:ngc);
+blocksize = nr*ngc;
+ii = repmat(ir(:),T,1) + kron((0:T-1).'*nr,ones(blocksize,1));
+jj = repmat(jc(:),T,1) + kron((0:T-1).'*ngc,ones(blocksize,1));
 
-% initial GC state (rough init via chaining f and J_f)
-xgc = zeros((p+1)*nx,1);
-xgc(1:nx) = x0(:);
-xgc = seed_generalised_state(xgc, theta, f, p, nx);
+% Seed observable directions once, then optimise one coupled trajectory.
+X = repmat(x0.',T,1);
+gx = jacobian_fd(@(x) g(x,theta),x0);
+for t = 1:T
+    dx = gx.'*((gx*gx.'+1e-3*eye(ny))\(y(t,:).'-model_value(g,x0,theta,ny)));
+    if norm(dx) > 2, dx = dx*(2/norm(dx)); end
+    X(t,:) = (x0+dx).';
+end
+v = reshape(X.',[],1);
+TRACE.Fa = zeros(1,outerIt); TRACE.sumsq_y = zeros(1,outerIt);
+TRACE.sumsq_x = zeros(1,outerIt); TRACE.theta_hist = zeros(np,outerIt);
+TRACE.lambda_hist = zeros(2,outerIt); TRACE.step_accepted = zeros(2,outerIt);
+TRACE.dstep_cost = zeros(2,outerIt); TRACE.estep_cost = zeros(2,outerIt);
+fh = [];
 
-% -------------------- DEM outer loop --------------------
 for it = 1:outerIt
-    % --- D-step: update x(t) path, given theta, precisions ---
-    ss_y = 0; ss_x = 0;  % accumulate squares for M-step
-    for t = 1:Tx
-        ygc_t = Ygc(t,:).';      % (p+1)*ny x 1
-        if t > 1, xgc = xgc_path(t-1,:).'; end
-
-        % ---- observation seeding: reduce y-residual at 0th order (cheap LS) ----
-        Xtmp = reshape(xgc, nx, p+1);
-        x0t  = Xtmp(:,1);
-
-        % ensure column shapes
-        y0 = ygc_t(1:ny);      y0 = y0(:);
-        g0 = g(x0t, theta);    g0 = g0(:);
-
-        % Jacobian (ny x nx)
-        Gy = jacobian_fd(@(x) g(x,theta), x0t);
-
-        % guard against any row/shape quirks
-        m = size(Gy,1);              % rows of Gy == output dim of g
-        y0 = y0(1:m);
-        g0 = g0(1:m);
-
-        % damped dual normal equations (works for any ny,nx)
-        reg = 1e-3;
-        A   = Gy;           % m x nx
-        b   = y0 - g0;      % m x 1
-        dx0 = A.' * ((A*A.' + reg*eye(m)) \ b);   % nx x 1
-
-        % clip step
-        mx = 2.0;
-        if norm(dx0) > mx, dx0 = dx0*(mx/norm(dx0)); end
-
-        Xtmp(:,1) = x0t + dx0;
-        xgc = Xtmp(:);
-        % ------------------------------------------------------------------------
-
-
-        % inner recognition updates for this time point
-        for k = 1:Dx_it
-            % residual vector r = [sqrt(ly)*W_y*eps_y ; sqrt(lx)*W_x*eps_x]
-            [r, epsy, epsx] = residual_gc(xgc, ygc_t, theta, f, g, Dop, wy, wx, nx, ny, p, py, ly, lx);
-            Jx = jacobian_fd(@(xz) residual_gc(xz, ygc_t, theta, f, g, Dop, wy, wx, nx, ny, p, py, ly, lx), xgc);
-
-            % weak prior tying to initial GC (only at t=1)
-            if t == 1
-                Hprior_x = (xgc0_C \ eye(size(xgc0_C)));
-                gprior_x = -Hprior_x*(xgc - xgc0_mu);
-            else
-                Hprior_x = 0;
-                gprior_x = 0;
-            end
-
-            Hx = (Jx.'*Jx) + blkdiag(Hprior_x);  % Gauss–Newton Hessian
-            gx = (Jx.'*r)  + gprior_x;           % gradient
-
-            % modest ridge for stability (let data term speak)
-            ridge = 1e-3 * trace(Hx)/max(1,numel(Hx));
-            Hx = Hx + ridge*eye(size(Hx));
-
-            % damped solve
-            dm = solve_posdef(Hx, gx);
-
-            % ---- simple Armijo / backoff ----
-            alpha = 1.0;
-            xgc_try = xgc + alpha*dm;
-            [r_try, ~, ~] = residual_gc(xgc_try, ygc_t, theta, f, g, Dop, wy, wx, nx, ny, p,py, ly, lx);
-
-            if norm(r_try) > norm(r)
-                alpha = 0.5;
-                xgc_try = xgc + alpha*dm;
-                [r_try, ~, ~] = residual_gc(xgc_try, ygc_t, theta, f, g, Dop, wy, wx, nx, ny, p,py, ly, lx);
-                if norm(r_try) > norm(r)
-                    alpha = 0.25;
-                    xgc_try = xgc + alpha*dm;
-                end
-            end
-
-            xgc = xgc_try;
-        end
-
-        xgc_path(t,:) = xgc.';
-        x_path(t,:)   = xgc(1:nx).';
-
-        % Accumulate squared errors for M-step
-        ss_y = ss_y + sum(epsy(1:ny).^2); % 0th-order only for ly
-        ss_x = ss_x + sum(epsx.^2);
+    % D-step: samples cannot assign derivatives independent of the trajectory.
+    statefun = @(z) state_residual(z,G,Ygc,theta,f,g,wy,wx,nx,ny,p,py,ly,lx,L0,mu0,ii,jj);
+    cost_x = @(z) squared_cost(statefun,z);
+    TRACE.dstep_cost(1,it) = cost_x(v);
+    for k = 1:Dx_it
+        [r,J] = statefun(v);
+        dv = solve_posdef(J.'*J,-J.'*r);
+        [v,accepted] = backtrack(cost_x,v,dv,1);
+        TRACE.step_accepted(1,it) = TRACE.step_accepted(1,it)+accepted;
+        if ~accepted, break; end
     end
+    TRACE.dstep_cost(2,it) = cost_x(v);
+    Xgc = reshape(G*v,ngc,T).';
 
-    % --- E-step: update theta (GN with low-rank precision) ---
-    gth = zeros(np,1);
-    Hth = zeros(np,np);
-    for t = 1:Tx
-        xgc_t = xgc_path(t,:).';
-        ygc_t = Ygc(t,:).';
-        rfun = @(th) residual_gc(xgc_t, ygc_t, th, f, g, Dop, wy, wx, nx, ny, p, py, ly, lx);
-        rt   = rfun(theta);
-        Jt   = jacobian_fd(rfun, theta);
-        Hth  = Hth + (Jt.'*Jt);
-        gth  = gth + (Jt.'*rt);
+    % E-step: account for the change in the hidden trajectory when theta
+    % changes. Solving the joint GN system is equivalent to eliminating the
+    % state block with a Schur complement; independent updates can stall.
+    [rt,Jt] = parameter_residual(theta,Xgc,Ygc,f,g,wy,wx,nx,ny,p,py,ly,lx);
+    [rx,Jx] = statefun(v);
+    Jtheta = [sparse(Jt);sparse(ngc,np)];
+    cross = Jx.'*Jtheta;
+    H = [Jx.'*Jx, cross;cross.',sparse(Jt.'*Jt+Htheta)];
+    b = [-Jx.'*rx;-Jt.'*rt-Htheta*(theta-pE_theta)];
+    dz = solve_posdef(H,b);
+    dtheta = dz(numel(v)+(1:np));
+    stepnorm = norm(dtheta./sqrt(diag(pC_theta)));
+    if stepnorm > max_step, dz = dz*(max_step/stepnorm); end
+    cost_joint = @(z) joint_cost(z,numel(v),G,Ygc,f,g,wy,wx,nx,ny,p,py,ly,lx,L0,mu0,ii,jj,pE_theta,Htheta);
+    z = [v;theta]; TRACE.estep_cost(1,it) = cost_joint(z);
+    [z,accepted] = backtrack(cost_joint,z,dz,alpha_theta);
+    TRACE.estep_cost(2,it) = cost_joint(z);
+    v = z(1:numel(v)); theta = z(numel(v)+(1:np));
+    Xgc = reshape(G*v,ngc,T).';
+    TRACE.step_accepted(2,it) = accepted;
+
+    % M-step: use exactly the weighted errors counted in the D/E steps.
+    [ss_y,ss_x] = residual_sums(Xgc,Ygc,theta,f,g,wy,wx,nx,ny,p,py);
+    dim_y = T*(py+1)*ny; dim_x = T*p*nx;
+    if it > burnY, ly = min(1e6,max(1e-6,(dim_y+.01)/(ss_y+.01))); end
+    if it > burnX && dim_x > 0
+        lx = min(1e6,max(1e-6,(dim_x+.01)/(ss_x+.01)));
+        lx = min(lx_target,lx*lx_ramp);
     end
-
-    % parameter prior
-    Hth_prior = (pC_theta \ eye(size(pC_theta)));
-    gth_prior = -Hth_prior*(theta - pE_theta);
-
-    Hth_elbo = Hth + Hth_prior;
-    gth_elbo = gth + gth_prior;
-
-    ridge_th = 1e-3 * trace(Hth_elbo)/max(1,numel(Hth_elbo));
-    Hth_elbo = Hth_elbo + ridge_th*eye(size(Hth_elbo));
-
-    % low-rank+diag precision factorisation for theta Hessian
-    [U,Sv,~] = svd(Hth_elbo, 'econ');
-    lam = diag(Sv);
-    k   = max(1, sum(lam >= varthr*lam(1)));
-    k   = min(k,kmax);
-    Vth = U(:,1:k)*sqrt(Sv(1:k,1:k));
-    Dth = diag(diag(Hth_elbo) - sum(Vth.^2,2));
-
-    % robust solve + cautious step with clipping
-    dth = solve_posdef(Hth_elbo, gth_elbo);
-    alpha_theta = 3e-3;        % smaller step
-    max_step    = 2.0;         % L2 clip
-    nrm = norm(dth); if nrm > max_step, dth = dth*(max_step/nrm); end
-    theta = theta + alpha_theta * dth;
-
-    % --- M-step: update precisions (Gamma posterior updates) ---
-    % weak priors (can be strengthened if needed)
-    nu_y = 1e-2;  beta_y = 1e-2;
-    nu_x = 1e-2;  beta_x = 1e-2;
-
-    % recompute with updated theta for sums of squares
-    ss_y = 0; ss_x = 0;
-    for t = 1:Tx
-        xgc_t = xgc_path(t,:).';  ygc_t = Ygc(t,:).';
-        [~, epsy, epsx] = residual_gc(xgc_t, ygc_t, theta, f, g, Dop, wy, wx, nx, ny, p, py, ly, lx);
-        ss_y = ss_y + sum(epsy(1:ny).^2);  % 0th order only
-        ss_x = ss_x + sum(epsx.^2);
+    d0 = Xgc(1,:).'-mu0; dth = theta-pE_theta;
+    TRACE.Fa(it) = -.5*(ly*ss_y+lx*ss_x+dth.'*Htheta*dth+d0.'*H0*d0);
+    TRACE.sumsq_y(it) = ss_y; TRACE.sumsq_x(it) = ss_x;
+    TRACE.theta_hist(:,it) = theta; TRACE.lambda_hist(:,it) = [ly;lx];
+    if verbose
+        fprintf('Iter %d | energy %.5g | ly %.4g | lx %.4g | ||dtheta|| %.4g\n', ...
+            it,-TRACE.Fa(it),ly,lx,norm(dtheta));
     end
-
-    dim_y0 = Tx * ny;             % only 0th order contributes to ly
-    dim_x  = Tx * (p+1)*nx;
-
-    % freeze during burn-in
-    if it > burnin_fix_ly
-        ly = max(1e-6, min(1e6, (nu_y + dim_y0) / (beta_y + ss_y + 1e-12)));
-    end
-    if it > burnin_fix_lx
-        lx = max(1e-6, min(1e6, (nu_x + dim_x ) / (beta_x + ss_x + 1e-12)));
-    end
-
-    % --- gentle ramp AFTER burn-in: reintroduce dynamics progressively ---
-    if it > burnin_fix_lx
-        lx = min(lambda_x_target, lx * lambda_x_ramp);
-    end
-
-    % --- bookkeeping & free-action (approximate) ---
-    Fa = -0.5*( ly*ss_y + lx*ss_x ) ...
-        -0.5*((theta - pE_theta).'*Hth_prior*(theta - pE_theta)) ...
-        -0.5*((xgc_path(1,:).' - xgc0_mu).'*((xgc0_C \ eye(size(xgc0_C)))*(xgc_path(1,:).' - xgc0_mu)));
-
-    theta_hist(:,it)  = theta;
-    lambda_hist(:,it) = [ly; lx];
-    Fa_trace(it)      = Fa;
-    sumsq_y(it)       = ss_y;
-    sumsq_x(it)       = ss_x;
-
-    if doplot
-        fprintf('Iter %d | Fa %.3f | ly %.3g | lx %.3g | ||dtheta|| %.3g\n', ...
-            it, Fa, ly, lx, norm(dth));
-    end
-
-    if doplot
-        % Set up figure on first iteration
-        if it == 1
-            fh = figure('Name','DEM-ThermoVL progress','Color','w');
-            tiledlayout(fh,2,2,'TileSpacing','compact','Padding','compact');
-        else
-            figure(fh);
-        end
-
-        % --- (a) observed vs predicted ---
-        nexttile(1); cla;
-        tspan = (0:Tx-1)*dt;
-
-        % predicted observation from current x_path
-        yhat = zeros(Tx,ny);
-        for tt = 1:Tx
-            yhat(tt,:) = g(xgc_path(tt,1:nx).',theta);
-        end
-
-        yy   = y(:,1);
-        yhat1= yhat(:,1);
-
-        delete(findobj(gca,'Type','Legend')); % paranoia
-        h1 = plot(tspan, yy,   'k-', 'LineWidth', 1.0); hold on;
-        h2 = plot(tspan, yhat1,'r-', 'LineWidth', 1.0);
-        lgd = legend([h1 h2], {'Observed','Predicted'}, 'Location','best');
-        set(lgd,'AutoUpdate','off');
-        title('Fit to data'); xlabel('Time'); ylabel('y');
-
-        % --- (b) Free-action trace ---
-        nexttile(2); cla;
-        plot(1:it,Fa_trace(1:it),'-o');
-        xlabel('Outer iter'); ylabel('Free-action');
-        title('Free-action');
-
-        % --- (c) Precisions ---
-        nexttile(3); cla;
-        plot(1:it,lambda_hist(1,1:it),'-o','DisplayName','\lambda_y'); hold on;
-        plot(1:it,lambda_hist(2,1:it),'-s','DisplayName','\lambda_x'); hold off;
-        legend show; xlabel('Outer iter'); ylabel('Precision');
-        title('Precisions');
-
-        % --- (d) Parameters ---
-        nexttile(4); cla;
-        plot(1:it,theta_hist(:,1:it)','-o');
-        xlabel('Outer iter'); ylabel('value');
-        title('Parameters');
-        drawnow;
-    end
+    if doplot, fh = plot_progress(fh,y,Xgc,theta,g,dt,TRACE,it,nx); end
 end
 
-% -------------------- outputs --------------------
-POST.x_path      = x_path;
-POST.xgc_path    = xgc_path;
-POST.theta_mean  = theta;
-POST.theta_V     = Vth;
-POST.theta_D     = Dth;
-POST.lambda_y    = ly;
-POST.lambda_x    = lx;
-
-TRACE.Fa         = Fa_trace;
-TRACE.sumsq_y    = sumsq_y;
-TRACE.sumsq_x    = sumsq_x;
-TRACE.theta_hist = theta_hist;
-TRACE.lambda_hist= lambda_hist;
-
-end % main
-
-% ==================== helpers ====================
-
-function [r, epsy, epsx] = residual_gc(xgc, ygc, theta, f, g, DopX, wy, wx, nx, ny, p, py, ly, lx)
-[~,  epsx] = eps_x_gc(xgc, theta, f, DopX, wx, nx, p);
-[~,  epsy] = eps_y_gc(xgc, ygc, theta, g, wy, nx, ny, p, py);
-r = [sqrt(ly)*epsy; sqrt(lx)*epsx];
+% Curvature at the returned parameters/precisions, excluding optimiser damping.
+[~,Jt] = parameter_residual(theta,Xgc,Ygc,f,g,wy,wx,nx,ny,p,py,ly,lx);
+H = Jt.'*Jt+Htheta; H = (H+H.')/2;
+[U,S] = svd(H,'econ'); lam = diag(S);
+k = min(kmax,max(1,sum(lam >= varthr*lam(1))));
+V = U(:,1:k)*diag(sqrt(lam(1:k)));
+POST.xgc_path = Xgc; POST.x_path = Xgc(:,1:nx);
+POST.theta_mean = theta; POST.theta_V = V;
+POST.theta_D = diag(max(1e-12,diag(H)-sum(V.^2,2)));
+L = chol(H,'lower'); POST.theta_C = L.'\(L\eye(np));
+POST.lambda_y = ly; POST.lambda_x = lx;
 end
 
-function [ygc_hat, epsy] = eps_y_gc(xgc, ygc, theta, g, wy, nx, ny, p, py)
-% Build ĝ̃ up to order py and form eps_y = W * ( ỹ - ĝ̃ )
-X   = reshape(xgc, nx, p+1);
-x0  = X(:,1);
-Yhat = zeros(ny, py+1);
+function [r,J] = state_residual(v,G,Y,theta,f,g,wy,wx,nx,ny,p,py,ly,lx,L0,mu0,ii,jj)
+T = size(Y,1); ngc = (p+1)*nx; nr = (py+1)*ny+p*nx;
+X = reshape(G*v,ngc,T).';
+rdata = zeros(nr,T);
+if nargout > 1, values = zeros(T*nr*ngc,1); end
+for t = 1:T
+    fun = @(z) residual_gc(z,Y(t,:).',theta,f,g,wy,wx,nx,ny,p,py,ly,lx);
+    xt = X(t,:).'; rdata(:,t) = fun(xt);
+    if nargout > 1
+        Jt = jacobian_fd(fun,xt);
+        values((t-1)*nr*ngc+(1:nr*ngc)) = Jt(:);
+    end
+end
+r = [rdata(:); L0*(X(1,:).'-mu0)];
+if nargout > 1
+    J = [sparse(ii,jj,values,T*nr,T*ngc)*G; L0*G(1:ngc,:)];
+end
+end
 
-% 0th order
-Yhat(:,1) = g(x0,theta);
+function [r,J] = parameter_residual(theta,X,Y,f,g,wy,wx,nx,ny,p,py,ly,lx)
+T = size(X,1); nr = (py+1)*ny+p*nx;
+r = zeros(T*nr,1);
+if nargout > 1, J = zeros(T*nr,numel(theta)); end
+for t = 1:T
+    fun = @(th) residual_gc(X(t,:).',Y(t,:).',th,f,g,wy,wx,nx,ny,p,py,ly,lx);
+    rows = (t-1)*nr+(1:nr); r(rows) = fun(theta);
+    if nargout > 1, J(rows,:) = jacobian_fd(fun,theta); end
+end
+end
 
+function [r,ey,ex] = residual_gc(xgc,ygc,theta,f,g,wy,wx,nx,ny,p,py,ly,lx)
+X = reshape(xgc,nx,p+1); x = X(:,1);
+Yhat = zeros(ny,py+1); Yhat(:,1) = model_value(g,x,theta,ny);
 if py >= 1
-    gx0 = jacobian_fd(@(x) g(x,theta), x0);
-    Yhat(:,2) = gx0 * X(:,2);
+    Jg = jacobian_fd(@(z) g(z,theta),x);
+    Yhat(:,2) = Jg*X(:,2);
 end
 if py >= 2
-    gx0 = jacobian_fd(@(x) g(x,theta), x0);
-    dir   = X(:,2); nd = max(1e-6, 1e-6*norm(dir));
-    gx_f  = jacobian_fd(@(x) g(x,theta), x0 + nd*dir);
-    dgx_d = (gx_f - gx0)/nd;
-    Yhat(:,3) = dgx_d*X(:,2) + gx0*X(:,3);
+    Yhat(:,3) = directional_second(@(z) g(z,theta),x,X(:,2))+Jg*X(:,3);
+end
+ey = reshape(bsxfun(@times,reshape(ygc,ny,py+1)-Yhat,wy),[],1);
+F = zeros(nx,p);
+if p >= 1, F(:,1) = model_value(f,x,theta,nx); end
+if p >= 2, F(:,2) = jacobian_fd(@(z) f(z,theta),x)*X(:,2); end
+ex = reshape(bsxfun(@times,X(:,2:end)-F,wx),[],1);
+r = [sqrt(ly)*ey;sqrt(lx)*ex];
 end
 
-ygc_hat = reshape(Yhat, (py+1)*ny, 1);
-W  = kron(diag(wy), eye(ny));
-epsy = W * (ygc - ygc_hat);
-end
-
-function [xflow_hat, epsx] = eps_x_gc(xgc, theta, f, DopX, wx, nx, p)
-% eps_x = W * ( D*x̃ – f̃ )
-X   = reshape(xgc, nx, p+1);
-x0  = X(:,1);
-fx0 = jacobian_fd(@(x) f(x,theta), x0);
-f0  = f(x0,theta);
-
-Fgc = zeros(nx, p+1);
-Fgc(:,1) = f0;
-if p >= 1
-    Fgc(:,2) = fx0 * X(:,2);
-end
-if p >= 2
-    dir   = X(:,2); nd = max(1e-6, 1e-6*norm(dir));
-    fx_f  = jacobian_fd(@(x) f(x,theta), x0 + nd*dir);
-    dfx_d = (fx_f - fx0)/nd;
-    Fgc(:,3) = dfx_d*X(:,2) + fx0*X(:,3);
-end
-
-Dxgc    = DopX * xgc;
-fgc_vec = Fgc(:);
-
-W = kron(diag(wx), eye(nx));
-epsx = W * (Dxgc - fgc_vec);
-xflow_hat = fgc_vec;
-end
-
-function J = jacobian_fd(fun, x)
-% central finite-difference Jacobian
-y0 = fun(x);
-m  = numel(y0);
-n  = numel(x);
-J  = zeros(m,n);
-eps0 = 1e-6;
-for i = 1:n
-    dx = zeros(n,1);  dx(i) = eps0*max(1,abs(x(i)));
-    fp = fun(x + dx);
-    fm = fun(x - dx);
-    J(:,i) = (fp - fm) / (2*dx(i));
+function [ssy,ssx] = residual_sums(X,Y,theta,f,g,wy,wx,nx,ny,p,py)
+ssy = 0; ssx = 0;
+for t = 1:size(X,1)
+    [~,ey,ex] = residual_gc(X(t,:).',Y(t,:).',theta,f,g,wy,wx,nx,ny,p,py,1,1);
+    ssy = ssy+ey.'*ey; ssx = ssx+ex.'*ex;
 end
 end
 
-function [sol, info] = solve_posdef(H, g)
-% Levenberg–Marquardt + diag-jitter + SVD fallback
-info = struct('lam',[],'method','chol');
-lam = 1e-3 * max(1, norm(H, 'fro')/max(1,numel(H)));  % scale-aware
-D   = diag(max(1e-12, diag(H)));                     % keep structure
+function D = derivative_operators(T,p,dt)
+D = {speye(T)};
+if p < 1, return; end
+if T == 2
+    D{2} = sparse([-1 1;-1 1])/dt;
+else
+    D{2} = spdiags([-ones(T,1),zeros(T,1),ones(T,1)],-1:1,T,T)/(2*dt);
+    D{2}(1,1:3) = [-3 4 -1]/(2*dt);
+    D{2}(T,T-2:T) = [1 -4 3]/(2*dt);
+end
+if p < 2, return; end
+D{3} = spdiags([ones(T,1),-2*ones(T,1),ones(T,1)],-1:1,T,T)/dt^2;
+if T == 3
+    D{3}(1,:) = [1 -2 1]/dt^2; D{3}(T,:) = [1 -2 1]/dt^2;
+else
+    D{3}(1,1:4) = [2 -5 4 -1]/dt^2;
+    D{3}(T,T-3:T) = [-1 4 -5 2]/dt^2;
+end
+end
 
-for k = 1:8
+function y = model_value(fun,x,theta,n)
+y = fun(x,theta); y = y(:);
+if numel(y) ~= n
+    error('fitDEM_ThermoVL:ModelSize','f must return nx values and g ny values; y must be T-by-ny.');
+end
+if ~isreal(y) || any(~isfinite(y))
+    error('fitDEM_ThermoVL:NonFiniteModel','The model returned complex or non-finite values.');
+end
+end
+
+function J = jacobian_fd(fun,x)
+y = fun(x); J = zeros(numel(y),numel(x));
+for k = 1:numel(x)
+    h = 1e-5*max(1,abs(x(k))); dx = zeros(size(x)); dx(k) = h;
+    fp = fun(x+dx); fm = fun(x-dx);
+    J(:,k) = (fp(:)-fm(:))/(2*h);
+end
+if ~isreal(J) || any(~isfinite(J(:)))
+    error('fitDEM_ThermoVL:NonFiniteModel','The model returned a non-finite finite-difference Jacobian.');
+end
+end
+
+function d2 = directional_second(fun,x,direction)
+scale = max(1,norm(direction)); h = 1e-3*max(1,norm(x)); u = direction/scale;
+fp = fun(x+h*u); fm = fun(x-h*u); f0 = fun(x);
+d2 = (fp(:)-2*f0(:)+fm(:))*(scale/h)^2;
+end
+
+function H = prior_precision(C,n,name)
+if ~isequal(size(C),[n n]) || ~isreal(C) || any(~isfinite(C(:))) || ...
+        norm(C-C.','fro') > 1e-10*max(1,norm(C,'fro'))
+    error('fitDEM_ThermoVL:PriorCovariance','%s must be finite, symmetric and n-by-n.',name);
+end
+[L,flag] = chol((C+C.')/2,'lower');
+if flag, error('fitDEM_ThermoVL:PriorCovariance','%s must be positive definite.',name); end
+H = L.'\(L\eye(n));
+end
+
+function dx = solve_posdef(H,b)
+if any(~isfinite(nonzeros(H))) || any(~isfinite(b))
+    error('fitDEM_ThermoVL:NonFiniteSystem','Cannot solve a non-finite update system.');
+end
+H = (H+H.')/2; n = size(H,1);
+% Dimensionless LM damping, without scaling that grows with T/dt^4.
+d = max(1e-12,full(diag(H))); lam = 1e-6;
+for k = 1:12
+    [L,flag] = chol(H+spdiags(lam*d+1e-12,0,n,n),'lower');
+    if flag == 0, dx = L.'\(L\b); return; end
+    lam = lam*10;
+end
+error('fitDEM_ThermoVL:SingularSystem','The damped update system could not be factorised.');
+end
+
+function c = squared_cost(fun,x)
+r = fun(x); c = .5*(r.'*r);
+if ~isreal(c) || ~isfinite(c), c = Inf; end
+end
+
+function c = joint_cost(z,nv,G,Y,f,g,wy,wx,nx,ny,p,py,ly,lx,L0,mu0,ii,jj,mu,H)
+theta = z(nv+1:end);
+r = state_residual(z(1:nv),G,Y,theta,f,g,wy,wx,nx,ny,p,py,ly,lx,L0,mu0,ii,jj);
+d = theta-mu; c = .5*(r.'*r+d.'*H*d);
+if ~isreal(c) || ~isfinite(c), c = Inf; end
+end
+
+function [xnew,accepted] = backtrack(cost,x,dx,alpha)
+c0 = cost(x);
+if ~isfinite(c0), error('fitDEM_ThermoVL:NonFiniteCost','Current model state has non-finite cost.'); end
+xnew = x; accepted = false;
+if any(~isfinite(dx)) || norm(dx) <= 1e-10*max(1,norm(x)), return; end
+for k = 1:20
     try
-        L = chol(H + lam*D + 1e-10*eye(size(H)), 'lower');
-        sol = L'\(L\g);
-        info.lam = lam;
-        return
-    catch
-        lam = lam * 10;         % increase damping
+        c = cost(x+alpha*dx);
+    catch err
+        if strcmp(err.identifier,'fitDEM_ThermoVL:NonFiniteModel'), c = Inf; else, rethrow(err); end
     end
+    if isfinite(c) && isreal(c) && c < c0
+        xnew = x+alpha*dx; accepted = true; return;
+    end
+    alpha = alpha/2;
 end
-% Fallback: truncated SVD (floor small singular values)
-[U,S,V] = svd(H, 'econ');
-s = diag(S);
-s_floor = 1e-8 * max(s);
-s(s < s_floor) = s_floor;
-sol = V * ((U' * g) ./ s);
-info.method = 'svd';
-info.lam = lam;
 end
 
-function Xgc = generalise_observation(y, p, dt)
-% Stack y, Dy, D2y via simple finite differences (optionally smoothed)
-[T,ny] = size(y);
-Ygc = zeros(T,(p+1)*ny);
-Ygc(:,1:ny) = y;           % 0th order
-if p >= 1
-    Dy = [diff(y)/dt; zeros(1,ny)];
-    Ygc(:,ny+(1:ny)) = Dy;
-end
-if p >= 2
-    D2y = [diff(Dy)/dt; zeros(1,ny)];
-    Ygc(:,2*ny+(1:ny)) = D2y;
-end
-Xgc = Ygc;
+function fh = plot_progress(fh,y,X,theta,g,dt,R,it,nx)
+if isempty(fh), fh = figure('Name','DEM-style smoother','Color','w'); end
+figure(fh); clf(fh);
+T = size(y,1); pred = zeros(T,size(y,2));
+for t = 1:T, yt = g(X(t,1:nx).',theta); pred(t,:) = yt(:).'; end
+subplot(2,2,1); plot((0:T-1)*dt,[y(:,1),pred(:,1)]); legend('Observed','Predicted'); xlabel('Time');
+subplot(2,2,2); plot(1:it,-R.Fa(1:it),'-o'); title('Penalised residual energy');
+subplot(2,2,3); plot(1:it,R.lambda_hist(:,1:it).','-o'); title('Precisions'); legend('lambda y','lambda x');
+subplot(2,2,4); plot(1:it,R.theta_hist(:,1:it).','-o'); title('Parameter means'); drawnow;
 end
 
-function xgc = seed_generalised_state(xgc, theta, f, p, nx)
-X = reshape(xgc, nx, p+1);
-x0 = X(:,1);
-if p >= 1
-    X(:,2) = f(x0,theta);
-end
-if p >= 2
-    fx0 = jacobian_fd(@(x) f(x,theta), x0);
-    X(:,3) = fx0*X(:,2);
-end
-xgc = X(:);
+function positive(x,name)
+validateattributes(x,{'numeric'},{'scalar','real','finite','positive'},mfilename,['opts.' name]);
 end
 
-function val = getd(s,field,default)
-if isfield(s,field) && ~isempty(s.(field)), val = s.(field); else, val = default; end
+function integer_range(x,lo,hi,name)
+validateattributes(x,{'numeric'},{'scalar','real','finite','integer','>=',lo,'<=',hi},mfilename,['opts.' name]);
+end
+
+function value = getd(s,name,default)
+if isfield(s,name) && ~isempty(s.(name)), value = s.(name); else, value = default; end
 end

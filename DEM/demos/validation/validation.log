@@ -1,0 +1,3 @@
+test_DEM_demos: 15 recovery runs passed.
+test_fitDEM_ThermoVL: all numerical regressions passed.
+Caller RNG preservation: PASS
